@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(subagent)",
+      "Read(//c/Users/DELL/.claude/skills/**)",
+      "mcp__pencil__get_editor_state",
+      "mcp__pencil__open_document",
+      "mcp__pencil__get_style_guide_tags",
+      "mcp__pencil__get_style_guide",
+      "mcp__pencil__batch_design"
+    ]
+  }
+}
