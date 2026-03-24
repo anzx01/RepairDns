@@ -2,8 +2,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
-import sys
-import os
 
 import dns_core as core
 
@@ -47,10 +45,17 @@ class App(tk.Tk):
         self.dns_configs: dict[str, dict] = {}
         self.selected_adapter = tk.StringVar()
         self.is_admin = core.is_admin()
+        self.settings = core.get_settings()
+        self._static_adapters: list[str] = []
+        self._monitor_job = None
+        self._refresh_in_progress = False
+        self._repair_in_progress = False
 
         self._build_ui()
         self._center()
-        self.after(100, self.refresh)
+        self.protocol('WM_DELETE_WINDOW', self._close_app)
+        self._schedule_monitor()
+        self.after(100, lambda: self.refresh(source='startup'))
 
     # ── 布局 ──────────────────────────────────────────
     def _build_ui(self):
@@ -80,7 +85,7 @@ class App(tk.Tk):
         close = tk.Label(bar, text='✕', bg=BG_ELEV, fg=GRAY,
                          font=FONT_M, width=3, cursor='hand2')
         close.place(relx=1, rely=0.5, x=-10, anchor='e')
-        close.bind('<Button-1>', lambda e: self.destroy())
+        close.bind('<Button-1>', lambda e: self._close_app())
 
         # 拖动
         bar.bind('<ButtonPress-1>', self._drag_start)
@@ -205,6 +210,31 @@ class App(tk.Tk):
         btn(bar, '≡  log', self._open_log).pack(side='right', padx=(0, 8), pady=8)
         btn(bar, '⚙  settings', self._open_settings).pack(side='right', padx=(0, 4), pady=8)
 
+    def _close_app(self):
+        if self._monitor_job is not None:
+            self.after_cancel(self._monitor_job)
+            self._monitor_job = None
+        self.destroy()
+
+    def reload_settings(self):
+        self.settings = core.get_settings()
+        self._schedule_monitor()
+        self.refresh(source='settings')
+
+    def _schedule_monitor(self):
+        if self._monitor_job is not None:
+            self.after_cancel(self._monitor_job)
+            self._monitor_job = None
+        if not self.settings.get('auto_monitor'):
+            return
+        interval_ms = self.settings.get('monitor_interval', 5) * 60 * 1000
+        self._monitor_job = self.after(interval_ms, self._monitor_tick)
+
+    def _monitor_tick(self):
+        self._monitor_job = None
+        self.refresh(source='monitor')
+        self._schedule_monitor()
+
     # ── 拖动 ──────────────────────────────────────────
     def _drag_start(self, e):
         self._drag_x, self._drag_y = e.x, e.y
@@ -220,48 +250,80 @@ class App(tk.Tk):
         self.geometry(f'{WIN_W}x{WIN_H}+{x}+{y}')
 
     # ── 数据刷新 ──────────────────────────────────────
-    def refresh(self):
+    def refresh(self, source='manual'):
+        if self._refresh_in_progress:
+            return
+        self._refresh_in_progress = True
         self.lbl_status.config(text='检测中...', fg=GRAY)
-        self.lbl_desc.config(text='正在扫描网络适配器...')
+        self.lbl_desc.config(text='正在扫描网络适配器...', fg=GRAY)
         self._draw_circle(GRAY, BG_CARD)
-        threading.Thread(target=self._do_refresh, daemon=True).start()
+        threading.Thread(target=self._do_refresh, args=(source,), daemon=True).start()
 
-    def _do_refresh(self):
-        adapters = core.get_active_adapters()
-        configs = {a['name']: core.get_dns_config(a['name']) for a in adapters}
-        self.after(0, self._apply_refresh, adapters, configs)
+    def _do_refresh(self, source):
+        try:
+            adapters = core.get_active_adapters()
+            configs = {a['name']: core.get_dns_config(a['name']) for a in adapters}
+            error = None
+        except Exception as exc:
+            adapters = []
+            configs = {}
+            error = str(exc)
+        self.after(0, self._apply_refresh, adapters, configs, source, error)
 
-    def _apply_refresh(self, adapters, configs):
+    def _apply_refresh(self, adapters, configs, source, error=None):
+        self._refresh_in_progress = False
         self.adapters = adapters
         self.dns_configs = configs
 
         names = [a['name'] for a in adapters]
         self.adapter_menu['values'] = names
+        if not names:
+            self.selected_adapter.set('')
 
         cur = self.selected_adapter.get()
         if not cur or cur not in names:
-            # 优先选有网关的
             primary = next((a for a in adapters if a['has_gateway']), adapters[0] if adapters else None)
             if primary:
                 self.selected_adapter.set(primary['name'])
 
-        self._update_status()
+        static_adapters = self._update_status(error=error)
+        if (
+            source in ('startup', 'monitor')
+            and self.settings.get('auto_monitor')
+            and self.settings.get('auto_repair')
+            and static_adapters
+            and not self._repair_in_progress
+        ):
+            self._start_repair(static_adapters, auto=True)
 
-    def _update_status(self):
+    def _update_status(self, error=None):
+        if error:
+            self._draw_circle(RED, '#2D1A1A')
+            self.lbl_dns_label.config(fg=RED)
+            self.lbl_status.config(text='CHECK_FAILED', fg=RED)
+            self.lbl_desc.config(text='网络状态读取失败', fg=GRAY)
+            self._set_info_row(0, 'DETAIL', '请以管理员身份重试', RED)
+            self._set_info_row(1, 'ERROR', error[:34], GRAY)
+            self._set_info_row(2, '', '')
+            self._set_repair_state([], note_text=f'[ERROR] {error}', note_color=RED, button_text='⚡  无法修复')
+            return []
+
         if not self.adapters:
             self._draw_circle(GRAY, BG_CARD)
+            self.lbl_dns_label.config(fg=GRAY)
             self.lbl_status.config(text='未检测到网络', fg=GRAY)
             self.lbl_desc.config(text='请检查网络连接', fg=GRAY)
-            self._set_repair_state([])
-            return
+            self._set_info_row(0, 'STATUS', '未发现活动适配器', GRAY)
+            self._set_info_row(1, '', '')
+            self._set_info_row(2, '', '')
+            self._set_repair_state([], note_text='[INFO] 当前未检测到可用网络适配器', note_color=GRAY, button_text='⚡  无可修复项')
+            return []
 
-        # 统计所有静态 DNS 适配器
         static_adapters = [
             a['name'] for a in self.adapters
             if self.dns_configs.get(a['name'], {}).get('mode') == 'static'
         ]
 
-        # 当前选中适配器用于详情展示
         name = self.selected_adapter.get()
         cfg = self.dns_configs.get(name, {})
         mode = cfg.get('mode', 'unknown')
@@ -272,17 +334,20 @@ class App(tk.Tk):
             self.lbl_dns_label.config(fg=RED)
             count = len(static_adapters)
             self.lbl_status.config(text='STATIC_DNS', fg=RED)
-            self.lbl_desc.config(
-                text=f'发现 {count} 个适配器 DNS 被修改', fg=GRAY)
+            self.lbl_desc.config(text=f'发现 {count} 个适配器 DNS 被修改', fg=GRAY)
             self._set_info_row(0, 'AFFECTED', f'{count} adapter(s)', RED)
             if mode == 'static':
-                self._set_info_row(1, 'PRIMARY_DNS', ips[0] if ips else '—', RED)
-                self._set_info_row(2, 'SECONDARY_DNS', ips[1] if len(ips) > 1 else '—', RED)
+                primary = ips[0] if ips else '—'
+                extras = ', '.join(ips[1:]) if len(ips) > 1 else '—'
+                self._set_info_row(1, 'PRIMARY_DNS', primary, RED)
+                self._set_info_row(2, 'OTHER_DNS', extras, RED)
             else:
-                self._set_info_row(1, 'ADAPTER', name)
+                self._set_info_row(1, 'ADAPTER', name or '—')
                 self._set_info_row(2, 'DNS_MODE', mode.upper(), GRAY)
             self._set_repair_state(static_adapters)
-        elif mode == 'dhcp' or all(
+            return static_adapters
+
+        if mode == 'dhcp' or all(
             self.dns_configs.get(a['name'], {}).get('mode') == 'dhcp'
             for a in self.adapters
         ):
@@ -290,31 +355,33 @@ class App(tk.Tk):
             self.lbl_dns_label.config(fg=TEAL)
             self.lbl_status.config(text='DHCP_AUTO', fg=TEAL)
             self.lbl_desc.config(text='所有适配器 DNS 自动获取，正常', fg=GRAY)
-            self._set_info_row(0, 'ADAPTER_NAME', name)
+            self._set_info_row(0, 'ADAPTER_NAME', name or '—')
             self._set_info_row(1, 'DNS_MODE', '■ 自动获取 (DHCP)', TEAL)
             self._set_info_row(2, '', '')
             self._set_repair_state([])
-        else:
-            self._draw_circle(GRAY, BG_CARD)
-            self.lbl_dns_label.config(fg=GRAY)
-            self.lbl_status.config(text='UNKNOWN', fg=GRAY)
-            self.lbl_desc.config(text='无法检测DNS状态', fg=GRAY)
-            self._set_info_row(0, 'ADAPTER_NAME', name)
-            self._set_info_row(1, '', '')
-            self._set_info_row(2, '', '')
-            self._set_repair_state([])
+            return []
 
-    def _set_repair_state(self, static_adapters: list):
+        self._draw_circle(GRAY, BG_CARD)
+        self.lbl_dns_label.config(fg=GRAY)
+        self.lbl_status.config(text='UNKNOWN', fg=GRAY)
+        self.lbl_desc.config(text='无法检测 DNS 状态', fg=GRAY)
+        self._set_info_row(0, 'ADAPTER_NAME', name or '—')
+        self._set_info_row(1, 'DNS_MODE', mode.upper(), GRAY)
+        self._set_info_row(2, '', '')
+        self._set_repair_state([], note_text='[INFO] DNS 状态未知，请手动检查', note_color=GRAY, button_text='⚡  暂不可修复')
+        return []
+
+    def _set_repair_state(self, static_adapters: list, note_text=None, note_color=GRAY, button_text=None):
         if static_adapters:
             count = len(static_adapters)
             label = f'⚡  修复全部 ({count} 个适配器)' if count > 1 else '⚡  立即修复 DNS'
-            self.repair_btn.config(bg=ORANGE, fg=BLACK_T,
-                                   text=label, cursor='hand2')
-            self.note_lbl.config(text='⚠  [WARNING] 修复前将自动备份当前配置', fg=GRAY)
+            self.repair_btn.config(bg=ORANGE, fg=BLACK_T, text=label, cursor='hand2')
+            default_note = '⚠  [WARNING] 修复前将自动备份当前配置'
         else:
-            self.repair_btn.config(bg=BG_ELEV, fg=BG_PH,
-                                   text='⚡  DNS 状态正常', cursor='arrow')
-            self.note_lbl.config(text='[OK] 无需修复，网络连接正常', fg=GRAY)
+            label = button_text or '⚡  DNS 状态正常'
+            self.repair_btn.config(bg=BG_ELEV, fg=BG_PH, text=label, cursor='arrow')
+            default_note = '[OK] 无需修复，网络连接正常'
+        self.note_lbl.config(text=note_text or default_note, fg=note_color if note_text else GRAY)
         self._static_adapters = static_adapters
 
     def _on_adapter_change(self, _=None):
@@ -325,34 +392,44 @@ class App(tk.Tk):
         targets = getattr(self, '_static_adapters', [])
         if not targets:
             return
-        self.repair_btn.config(text='修复中...', bg=BG_ELEV, fg=GRAY, cursor='arrow')
-        flush = core.get_settings().get('flush_on_repair', True)
+        self._start_repair(targets, auto=False)
+
+    def _start_repair(self, targets: list[str], auto: bool):
+        if not targets or self._repair_in_progress:
+            return
+        self._repair_in_progress = True
+        status_text = '自动修复中...' if auto else '修复中...'
+        note_text = '[AUTO] 已检测到静态 DNS，正在自动修复' if auto else '⚠  [WARNING] 修复前将自动备份当前配置'
+        note_color = TEAL if auto else GRAY
+        self.repair_btn.config(text=status_text, bg=BG_ELEV, fg=GRAY, cursor='arrow')
+        self.note_lbl.config(text=note_text, fg=note_color)
+        flush = self.settings.get('flush_on_repair', True)
         threading.Thread(
             target=self._do_repair,
-            args=(targets, flush),
+            args=(list(targets), flush, auto),
             daemon=True
         ).start()
 
-    def _do_repair(self, names: list, flush: bool):
-        results = [core.repair_dns(n, flush=(flush and i == len(names) - 1))
-                   for i, n in enumerate(names)]
-        self.after(0, self._apply_repair, results)
+    def _do_repair(self, names: list, flush: bool, auto: bool):
+        results = [
+            core.repair_dns(name, flush=(flush and index == len(names) - 1))
+            for index, name in enumerate(names)
+        ]
+        self.after(0, self._apply_repair, results, auto)
 
-    def _apply_repair(self, results: list):
+    def _apply_repair(self, results: list, auto: bool):
+        self._repair_in_progress = False
         failed = [r for r in results if not r['success']]
         if not failed:
             count = len(results)
-            self.note_lbl.config(
-                text=f'[OK] 修复成功，{count} 个适配器已恢复自动获取', fg=TEAL
-            )
-            self.refresh()
+            prefix = '[AUTO]' if auto else '[OK]'
+            self.note_lbl.config(text=f'{prefix} 修复成功，{count} 个适配器已恢复自动获取', fg=TEAL)
+            self.refresh(source='post-repair')
         else:
             errs = '; '.join(r.get('error', r['adapter']) for r in failed)
-            self.note_lbl.config(
-                text=f'[ERROR] 部分失败: {errs}', fg=RED
-            )
-            self.repair_btn.config(text='⚡  立即修复 DNS', bg=ORANGE,
-                                   fg=BLACK_T, cursor='hand2')
+            prefix = '自动修复失败' if auto else '部分失败'
+            self.note_lbl.config(text=f'[ERROR] {prefix}: {errs}', fg=RED)
+            self.repair_btn.config(text='⚡  立即修复 DNS', bg=ORANGE, fg=BLACK_T, cursor='hand2')
 
     # ── 子窗口 ────────────────────────────────────────
     def _open_settings(self):
@@ -366,8 +443,9 @@ class App(tk.Tk):
 class SettingsWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
+        self.parent_app = parent
         self.title('设置')
-        self.geometry('400x480')
+        self.geometry('400x420')
         self.resizable(False, False)
         self.configure(bg=BG)
         self.grab_set()
@@ -383,10 +461,6 @@ class SettingsWindow(tk.Toplevel):
         bar.pack_propagate(False)
         tk.Label(bar, text='SETTINGS', bg=BG_CARD, fg=WHITE,
                  font=FONT_H).place(x=16, rely=0.5, anchor='w')
-        tk.Label(bar, text='✕ close', bg=BG_ELEV, fg=GRAY,
-                 font=FONT_XS, padx=10, pady=4, cursor='hand2').place(
-            relx=1, x=-12, rely=0.5, anchor='e'
-        ).bind('<Button-1>', lambda e: self.destroy()) if False else None
         close = tk.Label(bar, text='✕ close', bg=BG_ELEV, fg=GRAY,
                          font=FONT_XS, padx=10, pady=4, cursor='hand2')
         close.place(relx=1, x=-12, rely=0.5, anchor='e')
@@ -406,7 +480,7 @@ class SettingsWindow(tk.Toplevel):
         seg = tk.Frame(row, bg=BG_CARD)
         seg.pack(side='right', padx=14, pady=8)
         self._vars['monitor_interval'] = tk.IntVar(value=self.settings.get('monitor_interval', 5))
-        for val in [5, 10, 30]:
+        for val in core.VALID_MONITOR_INTERVALS:
             b = tk.Label(seg, text=f'{val}min', bg=BG_ELEV, fg=GRAY,
                          font=FONT_XS, padx=10, pady=4, cursor='hand2')
             b.pack(side='left', padx=2)
@@ -417,10 +491,6 @@ class SettingsWindow(tk.Toplevel):
 
         self._toggle_row(content, 'auto_repair', 'auto_repair', '发现异常时自动修复')
         self._toggle_row(content, 'flush_on_repair', 'flush_on_repair', '修复时清除DNS缓存')
-
-        self._section(content, '// OTHER')
-        self._toggle_row(content, 'language', 'language_zh', '使用中文界面',
-                         is_bool=False, bool_val='zh')
 
         # 保存按钮
         save = tk.Label(content, text='✓  save_settings',
@@ -433,7 +503,7 @@ class SettingsWindow(tk.Toplevel):
         tk.Label(parent, text=text, bg=BG, fg=ORANGE,
                  font=FONT_XS, anchor='w').pack(fill='x', pady=(8, 2))
 
-    def _toggle_row(self, parent, key, var_key, desc, is_bool=True, bool_val=None):
+    def _toggle_row(self, parent, key, var_key, desc):
         row = tk.Frame(parent, bg=BG_CARD)
         row.pack(fill='x', pady=2)
         tk.Label(row, text=key, bg=BG_CARD, fg=WHITE,
@@ -441,10 +511,7 @@ class SettingsWindow(tk.Toplevel):
         tk.Label(row, text=desc, bg=BG_CARD, fg=GRAY,
                  font=FONT_XS).pack(side='left')
 
-        if is_bool:
-            var = tk.BooleanVar(value=bool(self.settings.get(key, False)))
-        else:
-            var = tk.BooleanVar(value=self.settings.get(key) == bool_val)
+        var = tk.BooleanVar(value=bool(self.settings.get(key, False)))
         self._vars[var_key] = var
 
         toggle = tk.Canvas(row, width=44, height=24, bg=BG_CARD,
@@ -467,7 +534,7 @@ class SettingsWindow(tk.Toplevel):
 
     def _select_interval(self, val: int):
         self._vars['monitor_interval'].set(val)
-        for v in [5, 10, 30]:
+        for v in core.VALID_MONITOR_INTERVALS:
             btn = getattr(self, f'_interval_btn_{v}', None)
             if btn:
                 btn.config(bg=ORANGE if v == val else BG_ELEV,
@@ -479,9 +546,8 @@ class SettingsWindow(tk.Toplevel):
             if key in self._vars:
                 s[key] = bool(self._vars[key].get())
         s['monitor_interval'] = self._vars['monitor_interval'].get()
-        if 'language_zh' in self._vars:
-            s['language'] = 'zh' if self._vars['language_zh'].get() else 'en'
         core.save_settings(s)
+        self.parent_app.reload_settings()
         self.destroy()
 
 
@@ -547,9 +613,12 @@ class LogWindow(tk.Toplevel):
             success = entry.get('success', False)
             before_ips = entry.get('before_ips', [])
             ip_str = before_ips[0] if before_ips else ''
+            after_mode = entry.get('after_mode') or 'unknown'
             status = 'OK' if success else 'FAIL'
             color = TEAL if success else RED
-            text = f'  [{action}] {adapter}  {ip_str}→DHCP  {status}  {ts}'
+            target = {'dhcp': 'DHCP', 'static': 'STATIC'}.get(after_mode, 'UNKNOWN')
+            source = ip_str or entry.get('before_mode', 'unknown').upper()
+            text = f'  [{action}] {adapter}  {source}→{target}  {status}  {ts}'
             self.listbox.insert('end', text)
             self.listbox.itemconfig('end', fg=color)
 
